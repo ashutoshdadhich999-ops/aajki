@@ -1,40 +1,113 @@
 """
-Forward corruption process for the audio (SpeechCommands) branch.
+Audio corruption processes for timestep-conditioned denoising.
 
-This is intentionally NOT a Gaussian DDPM process. It simulates a
-Poisson (spike-count) sensor: as the "timestep" t increases, the
-effective firing rate decays (gamma -> 0) and a small amount of
-Gaussian jitter is layered on top. The model is trained to predict
-the residual (noisy - clean) at a given t, i.e. single-step residual
-denoising conditioned on corruption strength -- not iterative ancestral
-sampling.
+Supports:
+    - Poisson
+    - Gaussian
+    - Bernoulli
+
+The model always predicts:
+    residual = noisy - clean
+
+allowing a fair comparison of corruption mechanisms.
 """
 
 import torch
 
 
-def poison(x0: torch.Tensor, t: torch.Tensor, T_audio: int, max_rate: float,
-           device: str, scale: float = 15.0, decay: float = 0.06,
-           jitter_std: float = 0.05):
-    """Corrupt a clean waveform batch `x0` at diffusion step `t`.
-
-    Returns:
-        noisy: corrupted waveform, clamped to [0, 1]
-        target: (noisy - x0), the residual the model is trained to predict
+def corrupt_audio(
+    x0: torch.Tensor,
+    t: torch.Tensor,
+    T_audio: int,
+    corruption: str = "poisson",
+    device: str = "cuda",
+    max_rate: float = 1.0,
+    scale: float = 15.0,
+):
     """
-    t = t.view(-1, 1).float().to(device)
-    gamma = torch.exp(-decay * t * 6 / T_audio)
+    Parameters
+    ----------
+    x0 : clean waveform in [0,1]
+    t : timestep
+    T_audio : total timesteps
+    corruption : poisson | gaussian | bernoulli
 
-    rate = x0 * gamma * max_rate
-    # FIX: clamp to an explicit [min, max] range instead of only a lower
-    # bound. Mathematically rate stays <= max_rate here since x0 in [0, 1]
-    # and gamma <= 1, but making the bound explicit avoids silent bugs if
-    # those assumptions ever change.
-    rate = torch.clamp(rate, min=1e-4, max=max_rate)
+    Returns
+    -------
+    noisy
+    residual_target = noisy - x0
+    """
 
-    counts = torch.poisson(rate * scale)
-    noisy = counts / scale
-    noisy = noisy + torch.randn_like(noisy) * jitter_std * (1 - gamma)
+    t = t.float().view(-1, 1).to(device)
+
+    # normalized timestep
+    tau = t / float(T_audio - 1)
+
+    # cosine schedule
+    gamma = torch.cos(tau * torch.pi / 2)
+
+    # -------------------------------------------------
+    # POISSON
+    # -------------------------------------------------
+
+    if corruption.lower() == "poisson":
+
+        signal = gamma * x0
+
+        rate = torch.clamp(
+            signal * max_rate,
+            min=1e-4,
+            max=max_rate
+        )
+
+        counts = torch.poisson(rate * scale)
+
+        poisson_noise = counts / scale
+
+        noisy = (
+            signal
+            + torch.sqrt(1 - gamma**2) * poisson_noise
+        )
+
+    # -------------------------------------------------
+    # GAUSSIAN
+    # -------------------------------------------------
+
+    elif corruption.lower() == "gaussian":
+
+        noise = torch.randn_like(x0)
+
+        noisy = (
+            gamma * x0
+            + torch.sqrt(1 - gamma**2) * noise
+        )
+
+    # -------------------------------------------------
+    # BERNOULLI
+    # -------------------------------------------------
+
+    elif corruption.lower() == "bernoulli":
+
+        prob = torch.clamp(
+            gamma * x0,
+            min=0.0,
+            max=1.0
+        )
+
+        spikes = torch.bernoulli(prob)
+
+        noisy = (
+            gamma * x0
+            + torch.sqrt(1 - gamma**2) * spikes
+        )
+
+    else:
+        raise ValueError(
+            f"Unknown corruption type: {corruption}"
+        )
 
     noisy = noisy.clamp(0, 1)
-    return noisy, noisy - x0
+
+    target = noisy - x0
+
+    return noisy, target
